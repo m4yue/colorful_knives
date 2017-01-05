@@ -5,66 +5,45 @@ import urllib
 import urllib2
 import cookielib
 import requests
+import lxml
 import xml.dom.minidom
 import json
 import time
 import re
-import sys
 import random
 import multiprocessing
-from threading import Thread, RLock
-import logging.config
+from threading import Thread
+from mylogger import logger, message_logger
+from workers import get_re_object, SHARE_Q, worker_set_keywords, worker_send_message_to_slack
 import httplib
-from redis import StrictRedis
-import Queue
-
-red_conn = StrictRedis(db=15)
-
-DEFAULT_KEYWORDS = u"所有人|all"
-
-global_re_keywords = re.compile(r"(%s)" % DEFAULT_KEYWORDS)
-
-keywords_lock = RLock()
-
-req_ss = requests.session()
-
-SHARE_Q = Queue.LifoQueue(maxsize=100)
 
 
-def worker_send_message_to_slack():
-    while True:
-        if not SHARE_Q.empty():
-            data = SHARE_Q.get()
-            try:
-                url = red_conn.get("note:slack:url")
-                ret = req_ss.post(url, json=data)
-                if ret.status_code != 200:
-                    logger.error("failed to slack:%s,%s", ret.status_code, ret.text)
-
-            except Exception as e:
-                logger.error("worker exception:%s", e)
-                SHARE_Q.put(data)
-        time.sleep(1)
+def _decode_list(data):
+    rv = []
+    for item in data:
+        if isinstance(item, unicode):
+            item = item.encode('utf-8')
+        elif isinstance(item, list):
+            item = _decode_list(item)
+        elif isinstance(item, dict):
+            item = _decode_dict(item)
+        rv.append(item)
+    return rv
 
 
-def set_keywords():
-    global global_re_keywords
-    while True:
-        value = red_conn.get('wechat:filter:keywords')
-        keywords_lock.acquire()
-        if not value:
-            logger.info("no value found in redis, using default setting.")
-            global_re_keywords = re.compile(r"(%s)" % DEFAULT_KEYWORDS)
-        else:
-            # value format: "xxx|xxx|xxx"
-            try:
-                global_re_keywords = re.compile(r"(%s)" % value.decode('utf-8'))
-            except Exception as e:
-                logger.exception("get keywords failed.<%s>", e)
-                global_re_keywords = re.compile(r"(%s)" % DEFAULT_KEYWORDS)
-
-        keywords_lock.release()
-        time.sleep(5)
+def _decode_dict(data):
+    rv = {}
+    for key, value in data.iteritems():
+        if isinstance(key, unicode):
+            key = key.encode('utf-8')
+        if isinstance(value, unicode):
+            value = value.encode('utf-8')
+        elif isinstance(value, list):
+            value = _decode_list(value)
+        elif isinstance(value, dict):
+            value = _decode_dict(value)
+        rv[key] = value
+    return rv
 
 
 def catchKeyboardInterrupt(fn):
@@ -305,21 +284,6 @@ class WebWeixin(object):
             logger.error("invalid sync check response:%s", data)
         return pm.groups()
 
-    def retrieve_messages(self):
-        url = self.base_uri + '/webwxsync?sid=%s&skey=%s&pass_ticket=%s' % (self.sid, self.skey, self.pass_ticket)
-
-        dic = self._post(url, {'BaseRequest': self.BaseRequest,
-                               'SyncKey': self.SyncKey,
-                               'rr': ~int(time.time())
-                               })
-        if dic == '':
-            return None
-
-        if dic['BaseResponse']['Ret'] == 0:
-            self.SyncKey = dic['SyncKey']
-            self.synckey = '|'.join(["%s_%s" % (keyVal['Key'], keyVal['Val']) for keyVal in self.SyncKey['List']])
-        return dic['AddMsgList']
-
     def send_message(self, word, user_openid):
         url = self.base_uri + '/webwxsendmsg?pass_ticket=%s' % self.pass_ticket
         clientMsgId = str(int(time.time() * 1000)) + str(random.random())[:5].replace('.', '')
@@ -364,6 +328,21 @@ class WebWeixin(object):
 
         return None
 
+    def retrieve_messages(self):
+        url = self.base_uri + '/webwxsync?sid=%s&skey=%s&pass_ticket=%s' % (self.sid, self.skey, self.pass_ticket)
+
+        dic = self._post(url, {'BaseRequest': self.BaseRequest,
+                               'SyncKey': self.SyncKey,
+                               'rr': ~int(time.time())
+                               })
+        if dic == '':
+            return None
+
+        if dic['BaseResponse']['Ret'] == 0:
+            self.SyncKey = dic['SyncKey']
+            self.synckey = '|'.join(["%s_%s" % (keyVal['Key'], keyVal['Val']) for keyVal in self.SyncKey['List']])
+        return dic['AddMsgList']
+
     def show_text_message(self, message):
         src = self.get_readable_name(message['FromUserName'])
         dst = self.get_readable_name(message['ToUserName'])
@@ -371,7 +350,11 @@ class WebWeixin(object):
 
         if message['MsgType'] == 1:
             if message['FromUserName'][:2] == '@@':
-                logger.debug("re result:<%s> from %s", global_re_keywords.findall(content.decode('utf-8')), content)
+                # re need unicode, so decode(content)
+                re_keywords = get_re_object()
+                logger.debug('pattern:%s', re_keywords.pattern)
+                matched_words = re_keywords.findall(content.decode('utf-8'))
+                logger.debug("re result:<%s> from %s", ",".join([b.encode('utf-8') for b in matched_words]), content)
 
                 # 接收到来自群的消息
                 if ":<br/>" in content:
@@ -379,9 +362,14 @@ class WebWeixin(object):
                     speaker = self.get_readable_name(people)
                     content = content.replace('<br/>', '\n')
                     logger.info('[%s] %s:<%s>' % (src.strip(), speaker.strip(), content))
-                    if global_re_keywords.findall(content.decode('utf-8')):
+                    if matched_words:
+                        tmp = content.decode('utf-8')
+                        for b in set(matched_words):
+                            tmp = re.sub(b, ' *%s* ' % b, tmp)
+
                         message_logger.info('!!![%s] %s:<%s>' % (src.strip(), speaker.strip(), content))
-                        data = {"text": "[%s]%s: %s" % (src.strip(), speaker.strip(), content)}
+                        logger.debug('bolded content:%s', tmp)
+                        data = {"text": "[%s]%s: %s" % (src.strip(), speaker.strip(), tmp.encode('utf-8'))}
                         SHARE_Q.put(data)
             else:
                 message_logger.info('!!!%s -> %s: %s' % (src.strip(), dst.strip(), content.replace('<br/>', '\n')))
@@ -389,17 +377,24 @@ class WebWeixin(object):
                     data = {"text": "%s: %s" % (src.strip(), content.replace('<br/>', '\n'))}
                     SHARE_Q.put(data)
         else:
-            logger.debug("unknown message,%s->%s:%s,file?<%s>", src, dst, content, message.get("FileName", "nofile"))
+            file_name = message.get("FileName", "nofile")
+            if file_name:
+                logger.debug("unknown message,%s->%s:%s,file?<%s>", src, dst, content, file_name)
+                if message['FromUserName'] != self.User['UserName']:  # not self sent.
+                    ret = re.findall(r"\[(http.*?weixin.*?)\]", content)
+                    if not ret:
+                        return
 
-    def handle_messages(self, message_list):
-        for msg in message_list:
-            self.show_text_message(msg)
+                    data = {"text": "%s: <%s|%s>" % (src.strip(), list(set(ret))[0], file_name)}
+                    SHARE_Q.put(data)
+            else:
+                logger.debug("unknown message,%s->%s:%s", src, dst, content)
 
     def sync_message(self):
         logger.info('[*] 进入消息监听模式 ... 成功')
         self._run('[*] 进行同步线路测试 ... ', self.check_wexin_hosts)
 
-        configure_monitor = Thread(target=set_keywords)
+        configure_monitor = Thread(target=worker_set_keywords)
         configure_monitor.setDaemon(True)
         configure_monitor.start()
         logger.info("keywords monitor started.")
@@ -428,7 +423,7 @@ class WebWeixin(object):
                 else:  # selector == '0':
                     time.sleep(1)
 
-            if (time.time() - self.last_check) <= 20:
+            if (time.time() - self.last_check) <= 10:
                 time.sleep(time.time() - self.last_check)
 
     def send_message_by_nick(self, nick, word):
@@ -573,60 +568,5 @@ class WebWeixin(object):
         return '未知'
 
 
-class MyLogFormatter(logging.Formatter):
-    """
-    Inspired by
-    `tornado <http://www.tornadoweb.org/en/stable/log.html?highlight=logformatter#tornado.log.LogFormatter>`_.
-    """
-
-    converter = time.gmtime
-
-    DEFAULT_FORMAT = '[%(levelname)1.1s %(asctime)s.%(msecs)03dZ %(module)s:%(lineno)d] %(message)s'
-    DEFAULT_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
-
-    def __init__(self, fmt=DEFAULT_FORMAT, datefmt=DEFAULT_DATE_FORMAT):
-        super(MyLogFormatter, self).__init__(fmt=fmt, datefmt=datefmt)
-
-
 if __name__ == '__main__':
-    logging.config.dictConfig({'version': 1,
-                               'disable_existing_loggers': True,  # 'incremental': False,
-                               'formatters': {'myformatter': {'()': MyLogFormatter,
-                                                              },
-                                              'messages': {
-                                                  'format': '[%(levelname)1.1s %(asctime)s]: \n--->%(message)s',
-                                                  'datefmt': '%Y-%m-%d %H:%M:%S'
-                                              }
-                                              },
-                               'handlers': {'console': {'class': 'logging.StreamHandler',
-                                                        'formatter': 'myformatter'
-                                                        },
-                                            'file_tmp': {'class': 'logging.FileHandler',
-                                                         'filename': '/tmp/wexinweb.log',
-                                                         'formatter': 'myformatter'
-                                                         },
-                                            'message_wexin': {'class': 'logging.FileHandler',
-                                                              'filename': '/tmp/wexin_message.log',
-                                                              'formatter': 'messages'
-                                                              }
-
-                                            },
-                               'loggers': {'root': {'handlers': ['console', 'file_tmp'],
-                                                    'propagate': False,
-                                                    'level': 'DEBUG'
-                                                    },
-                                           'message_logger': {'handlers': ['console', 'message_wexin'],
-                                                              'propagate': False,
-                                                              'level': 'INFO'
-                                                              },
-                                           }
-                               })
-    logger = logging.getLogger('root')
-    logger.setLevel("DEBUG")
-    message_logger = logging.getLogger('message_logger')
-    if not sys.platform.startswith('win'):
-        import coloredlogs
-
-        coloredlogs.install(level='DEBUG')
-
     WebWeixin().start()
