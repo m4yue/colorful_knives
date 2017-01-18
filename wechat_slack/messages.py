@@ -14,7 +14,7 @@ import random
 import multiprocessing
 from threading import Thread
 from mylogger import logger, message_logger
-from workers import get_re_object, SHARE_Q, worker_set_keywords, worker_send_message_to_slack
+from workers import get_re_object, get_request_interval, SHARE_Q, worker_set_keywords, worker_send_message_to_slack
 import httplib
 
 
@@ -276,7 +276,9 @@ class WebWeixin(object):
                                                                                                  'synckey': self.synckey,
                                                                                                  '_': int(time.time()),
                                                                                                  })
+
         data = self._get(url)
+        logger.debug("sync check: <%s>", data)
         if data == '':
             return [-1, -1]
         pm = re.search(r"window.synccheck={retcode:\"(\d+)\",selector:\"(\d+)\"}", data)
@@ -337,6 +339,7 @@ class WebWeixin(object):
                                })
         if dic == '':
             return None
+        logger.debug("retrieve message: %s", dic)
 
         if dic['BaseResponse']['Ret'] == 0:
             self.SyncKey = dic['SyncKey']
@@ -381,14 +384,16 @@ class WebWeixin(object):
             if file_name:
                 logger.debug("unknown message,%s->%s:%s,file?<%s>", src, dst, content, file_name)
                 if message['FromUserName'] != self.User['UserName']:  # not self sent.
-                    ret = re.findall(r"\[(http.*?weixin.*?)\]", content)
+                    ret = re.findall(r"\[(http://mp.weixin.*?)\]", content)
                     if not ret:
                         return
 
                     data = {"text": "%s: <%s|%s>" % (src.strip(), list(set(ret))[0], file_name)}
                     SHARE_Q.put(data)
             else:
-                logger.debug("unknown message,%s->%s:%s", src, dst, content)
+                logger.debug("unknown message,%s->%s:\n%s", src, dst, message)
+
+        logger.debug("showed message.")
 
     def sync_message(self):
         logger.info('[*] 进入消息监听模式 ... 成功')
@@ -397,15 +402,16 @@ class WebWeixin(object):
         configure_monitor = Thread(target=worker_set_keywords)
         configure_monitor.setDaemon(True)
         configure_monitor.start()
-        logger.info("keywords monitor started.")
+        logger.info("keywords monitor <%s> started.", configure_monitor.ident)
 
         push_to_slack = Thread(target=worker_send_message_to_slack)
         push_to_slack.setDaemon(True)
         push_to_slack.start()
-        logger.info("slack message worker started.")
+        logger.info("slack message worker <%s> started.", push_to_slack.ident)
 
         while True:
-            self.last_check = time.time()
+            logger.debug("sync msg process awake.")
+
             [retcode, selector] = self.synccheck()
 
             if retcode == '1100':
@@ -414,17 +420,21 @@ class WebWeixin(object):
             elif retcode == '1101':
                 logger.debug('[*] 你在其他地方登录了 WEB 版微信，再见')
                 break
+            elif retcode == '1102':
+                for msg in self.retrieve_messages():
+                    message_logger.debug("1102 message: %s", msg)
             else:  # retcode == '0':
                 if selector == '2':  # new messages
-                    logger.info('new messages')
+                    logger.debug("new message")
                     for msg in self.retrieve_messages():
                         self.show_text_message(msg)
-                        # self.handle_messages()
-                else:  # selector == '0':
-                    time.sleep(1)
+                else:
+                    for msg in self.retrieve_messages():
+                        message_logger.debug("retcode<%s>,selector<%s>, unknown: %s", retcode, selector, msg)
 
-            if (time.time() - self.last_check) <= 10:
-                time.sleep(time.time() - self.last_check)
+            t = get_request_interval()
+            # logger.debug("t is %s", t)
+            time.sleep(t)
 
     def send_message_by_nick(self, nick, word):
         user_openid = self.get_openid(nick)
@@ -463,8 +473,9 @@ class WebWeixin(object):
         # logger.debug(self)
         logger.debug("self info:%s", self.User)
 
-        message_monitor = multiprocessing.Process(target=self.sync_message)
+        message_monitor = multiprocessing.Process(target=self.sync_message, name='message_monitor')
         message_monitor.start()
+        logger.info('message_monitor pid:%s', message_monitor.pid)
 
         while True:
             text = raw_input('')

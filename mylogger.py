@@ -40,7 +40,11 @@ logging.config.dictConfig({'version': 1,
                                         'message_wexin': {'class': 'logging.FileHandler',
                                                           'filename': '/tmp/wexin_message.log',
                                                           'formatter': 'messages'
-                                                          }
+                                                          },
+                                        'worker': {'class': 'logging.FileHandler',
+                                                   'filename': '/tmp/worker.log',
+                                                   'formatter': 'messages'
+                                                   }
 
                                         },
                            'loggers': {'root': {'handlers': ['console', 'file_tmp'],
@@ -51,9 +55,14 @@ logging.config.dictConfig({'version': 1,
                                                           'propagate': False,
                                                           'level': 'INFO'
                                                           },
+                                       'worker_logger': {'handlers': ['console', 'worker'],
+                                                         'propagate': False,
+                                                         'level': 'DEBUG'
+                                                         },
                                        }
                            })
 
 logger = logging.getLogger('root')
 logger.setLevel("DEBUG")
 message_logger = logging.getLogger('message_logger')
+worker_logger = logging.getLogger('worker_logger')
